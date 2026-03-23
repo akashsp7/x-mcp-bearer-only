@@ -1,0 +1,1 @@
+# x-mcp-bearer-only
