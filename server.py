@@ -1,9 +1,11 @@
+import argparse
 import copy
 import http.server
 import json
 import logging
 import os
 import socketserver
+import sys
 import threading
 import time
 import urllib.parse
@@ -33,6 +35,7 @@ OAUTH_LOGGER = logging.getLogger("xmcp.oauth1")
 REQUEST_TOKEN_URL = "https://api.x.com/oauth/request_token"
 AUTHORIZE_URL = "https://api.x.com/oauth/authorize"
 ACCESS_TOKEN_URL = "https://api.x.com/oauth/access_token"
+MCP_TRANSPORTS = {"stdio", "http", "sse", "streamable-http"}
 
 
 def is_truthy(value: str | None) -> bool:
@@ -46,6 +49,10 @@ def parse_csv_env(key: str) -> set[str]:
     if not raw.strip():
         return set()
     return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def print_stderr(*args: object) -> None:
+    print(*args, file=sys.stderr)
 
 
 def should_join_query_param(param: dict) -> bool:
@@ -243,6 +250,13 @@ def filter_openapi_spec(spec: dict) -> dict:
     allow_tags = {tag.lower() for tag in parse_csv_env("X_API_TOOL_TAGS")}
     allow_ops = parse_csv_env("X_API_TOOL_ALLOWLIST")
     deny_ops = parse_csv_env("X_API_TOOL_DENYLIST")
+    read_only_only = is_truthy(os.getenv("X_READ_ONLY_ONLY", "0"))
+
+    if read_only_only and not allow_ops:
+        raise RuntimeError(
+            "Set X_API_TOOL_ALLOWLIST when X_READ_ONLY_ONLY=1 so the server only "
+            "exposes an explicit read-only tool set."
+        )
 
     for path, item in paths.items():
         if not isinstance(item, dict):
@@ -251,6 +265,8 @@ def filter_openapi_spec(spec: dict) -> dict:
         new_item = {}
         for key, value in item.items():
             if key.lower() in HTTP_METHODS:
+                if read_only_only and key.lower() != "get":
+                    continue
                 if should_exclude_operation(path, value):
                     continue
                 operation_id = value.get("operationId")
@@ -291,20 +307,52 @@ def print_tool_list(spec: dict) -> None:
                 tools.append(f"{method.upper()} {path}")
 
     tools.sort()
-    print(f"Loaded {len(tools)} tools from OpenAPI:")
+    print_stderr(f"Loaded {len(tools)} tools from OpenAPI:")
     for tool in tools:
-        print(f"- {tool}")
+        print_stderr(f"- {tool}")
 
 
-def get_auth_headers(oauth_token: str | None = None) -> dict:
-    env_oauth_token = os.getenv("X_OAUTH_ACCESS_TOKEN", "").strip()
-    bearer_token = os.getenv("X_BEARER_TOKEN", "").strip()
-    token = oauth_token or env_oauth_token or bearer_token
-    if not token:
+def get_bearer_token(required: bool = True) -> str:
+    for key in ("X_BEARER_TOKEN", "X_OAUTH_ACCESS_TOKEN"):
+        token = os.getenv(key, "").strip()
+        if token:
+            return token
+    if required:
         raise RuntimeError(
-            "Set X_BEARER_TOKEN or provide OAuth1 access token on startup."
+            "Missing X_BEARER_TOKEN (or X_OAUTH_ACCESS_TOKEN) for bearer auth."
         )
-    return {"Authorization": f"Bearer {token}"}
+    return ""
+
+
+def resolve_auth_mode() -> str:
+    requested = os.getenv("X_AUTH_MODE", "auto").strip().lower()
+    if requested not in {"", "auto", "bearer", "oauth1"}:
+        raise RuntimeError("X_AUTH_MODE must be one of: auto, bearer, oauth1.")
+
+    consumer_key = os.getenv("X_OAUTH_CONSUMER_KEY", "").strip()
+    consumer_secret = os.getenv("X_OAUTH_CONSUMER_SECRET", "").strip()
+    has_oauth1_creds = bool(consumer_key and consumer_secret)
+    has_bearer = bool(get_bearer_token(required=False))
+
+    if requested in {"", "auto"}:
+        if has_bearer:
+            return "bearer"
+        if has_oauth1_creds:
+            return "oauth1"
+        raise RuntimeError(
+            "No usable auth configuration found. Set X_BEARER_TOKEN for app-only "
+            "read access, or set X_OAUTH_CONSUMER_KEY and "
+            "X_OAUTH_CONSUMER_SECRET for OAuth1."
+        )
+
+    if requested == "bearer" and not has_bearer:
+        raise RuntimeError("X_AUTH_MODE=bearer requires X_BEARER_TOKEN.")
+    if requested == "oauth1" and not has_oauth1_creds:
+        raise RuntimeError(
+            "X_AUTH_MODE=oauth1 requires X_OAUTH_CONSUMER_KEY and "
+            "X_OAUTH_CONSUMER_SECRET."
+        )
+    return requested
 
 
 def build_oauth1_client() -> OAuth1Client:
@@ -314,10 +362,13 @@ def build_oauth1_client() -> OAuth1Client:
         raise RuntimeError(
             "Missing X_OAUTH_CONSUMER_KEY or X_OAUTH_CONSUMER_SECRET for OAuth1 signing."
         )
-    access_token, access_secret = run_oauth1_flow()
+    access_token = os.getenv("X_OAUTH_ACCESS_TOKEN", "").strip()
+    access_secret = os.getenv("X_OAUTH_ACCESS_TOKEN_SECRET", "").strip()
+    if not access_token or not access_secret:
+        access_token, access_secret = run_oauth1_flow()
     if is_truthy(os.getenv("X_OAUTH_PRINT_TOKENS", "0")):
-        print("OAuth1 access token:", access_token)
-        print("OAuth1 access token secret:", access_secret)
+        print_stderr("OAuth1 access token:", access_token)
+        print_stderr("OAuth1 access token secret:", access_secret)
     LOGGER.info("OAuth1 access token: %s", access_token)
     return OAuth1Client(
         client_key=consumer_key,
@@ -337,9 +388,12 @@ def print_oauth1_header_probe(oauth1_client: OAuth1Client, base_url: str) -> Non
     )
     auth_header = signed_headers.get("Authorization")
     if auth_header:
-        print("OAuth1 Authorization header (sample GET /2/users/me):", auth_header)
+        print_stderr(
+            "OAuth1 Authorization header (sample GET /2/users/me):",
+            auth_header,
+        )
     else:
-        print("OAuth1 Authorization header missing from signed probe request.")
+        print_stderr("OAuth1 Authorization header missing from signed probe request.")
 
 
 def create_mcp() -> FastMCP:
@@ -351,10 +405,14 @@ def create_mcp() -> FastMCP:
 
     base_url = os.getenv("X_API_BASE_URL", "https://api.x.com")
     timeout = float(os.getenv("X_API_TIMEOUT", "30"))
+    auth_mode = resolve_auth_mode()
+    LOGGER.info("Using X auth mode: %s", auth_mode)
 
-    oauth1_client = build_oauth1_client()
+    oauth1_client: OAuth1Client | None = None
     print_oauth_header = is_truthy(os.getenv("X_OAUTH_PRINT_AUTH_HEADER", "0"))
-    if print_oauth_header:
+    if auth_mode == "oauth1":
+        oauth1_client = build_oauth1_client()
+    if auth_mode == "oauth1" and print_oauth_header:
         print_oauth1_header_probe(oauth1_client, base_url)
 
     spec = load_openapi_spec()
@@ -395,6 +453,8 @@ def create_mcp() -> FastMCP:
     b3_flags = os.getenv("X_B3_FLAGS", "1")
 
     async def sign_oauth1_request(request: httpx.Request) -> None:
+        if oauth1_client is None:
+            raise RuntimeError("OAuth1 client not initialized.")
         request.headers["X-B3-Flags"] = b3_flags
         headers = dict(request.headers)
         content_type = headers.get("Content-Type", "")
@@ -413,9 +473,9 @@ def create_mcp() -> FastMCP:
         if print_oauth_header:
             auth_header = signed_headers.get("Authorization")
             if auth_header:
-                print("OAuth1 Authorization header:", auth_header)
+                print_stderr("OAuth1 Authorization header:", auth_header)
             else:
-                print("OAuth1 Authorization header missing from signed request.")
+                print_stderr("OAuth1 Authorization header missing from signed request.")
 
     async def log_request(request: httpx.Request) -> None:
         if not debug_enabled:
@@ -441,12 +501,20 @@ def create_mcp() -> FastMCP:
                 text = text[:1000] + "...<truncated>"
             LOGGER.warning("X API error body: %s", text)
 
+    request_hooks = [normalize_query_params]
+    client_headers: dict[str, str] = {}
+    if auth_mode == "oauth1":
+        request_hooks.append(sign_oauth1_request)
+    else:
+        client_headers["Authorization"] = f"Bearer {get_bearer_token()}"
+    request_hooks.append(log_request)
+
     client = httpx.AsyncClient(
         base_url=base_url,
-        headers={},
+        headers=client_headers,
         timeout=timeout,
         event_hooks={
-            "request": [normalize_query_params, sign_oauth1_request, log_request],
+            "request": request_hooks,
             "response": [log_response],
         },
     )
@@ -457,11 +525,36 @@ def create_mcp() -> FastMCP:
     )
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the X API MCP server.")
+    parser.add_argument(
+        "--transport",
+        choices=sorted(MCP_TRANSPORTS),
+        help="MCP transport to use. Defaults to the MCP_TRANSPORT env var or http.",
+    )
+    parser.add_argument("--host", help="Host to bind for HTTP/SSE transports.")
+    parser.add_argument("--port", type=int, help="Port to bind for HTTP/SSE transports.")
+    return parser.parse_args()
+
+
 def main() -> None:
-    host = os.getenv("MCP_HOST", "127.0.0.1")
-    port = int(os.getenv("MCP_PORT", "8000"))
+    args = parse_args()
+    transport = args.transport or os.getenv("MCP_TRANSPORT", "http")
+    if transport not in MCP_TRANSPORTS:
+        raise RuntimeError(
+            "MCP transport must be one of: stdio, http, sse, streamable-http."
+        )
+
+    host = args.host or os.getenv("MCP_HOST", "127.0.0.1")
+    port = args.port or int(os.getenv("MCP_PORT", "8000"))
+    path = os.getenv("MCP_PATH", "/mcp")
     mcp = create_mcp()
-    mcp.run(transport="http", host=host, port=port)
+    kwargs: dict[str, object] = {"transport": transport, "show_banner": False}
+    if transport in {"http", "sse", "streamable-http"}:
+        kwargs.update({"host": host, "port": port})
+    if transport in {"http", "streamable-http"}:
+        kwargs["path"] = path
+    mcp.run(**kwargs)
 
 
 if __name__ == "__main__":

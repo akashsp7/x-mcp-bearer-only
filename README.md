@@ -3,13 +3,51 @@
 Run a local MCP server that exposes the X API OpenAPI spec as tools using
 FastMCP. Streaming and webhook endpoints are excluded.
 
+This repo now supports two useful modes:
+
+- Bearer-token mode for public read-only access
+- OAuth1 mode for user-context endpoints
+
+For a strict read-only Codex setup, use the Bearer-token mode and the provided
+read-only profile.
+
 ## Prerequisites
 
-- Python 3.9+
-- An X Developer Platform app (to get tokens)
+- Python 3.10+
+- An X Developer Platform app
 - Optional: an xAI API key if you want to run the Grok test client
 
-## Setup (local)
+## Recommended setup for strict read-only access
+
+This is the safest profile for your use case. It exposes only a conservative
+allowlist of GET-only tools and does not request write-capable OAuth consent.
+
+1. Create a virtual environment and install dependencies:
+   - `python -m venv .venv`
+   - `source .venv/bin/activate`
+   - `pip install -r requirements.txt`
+2. Create your local `.env` from the read-only template:
+   - `cp .env.readonly.example .env`
+3. In the X Developer Console, copy your app's Bearer token into:
+   - `X_BEARER_TOKEN`
+4. Smoke test the server over stdio:
+   - `.venv/bin/python smoke_test.py`
+   - Optional live lookup: `.venv/bin/python smoke_test.py --username x`
+5. Install it into Codex as a stdio MCP server:
+   - `codex mcp add x-mcp-readonly -- /Users/akash/Documents/WORK/x-mcp/run_codex_stdio.sh`
+6. Confirm the configuration:
+   - `codex mcp get x-mcp-readonly`
+
+Notes:
+
+- `X_READ_ONLY_ONLY=1` forces the server to expose only GET operations.
+- The provided allowlist is intentionally conservative. It excludes DMs,
+  bookmarks, likes, follows, mute/block actions, media upload, and all other
+  write-capable endpoints.
+- Some read endpoints on X still require user-context auth. Those are not part
+  of the default read-only allowlist here.
+
+## General setup (local)
 
 1. Create a virtual environment and install dependencies:
    - `python -m venv .venv`
@@ -17,10 +55,15 @@ FastMCP. Streaming and webhook endpoints are excluded.
    - `pip install -r requirements.txt`
 2. Create your local `.env`:
    - `cp env.example .env`
-   - Required values (do not skip):
+   - Choose an auth mode:
+     - `X_AUTH_MODE=bearer` for public read-only access with `X_BEARER_TOKEN`
+     - `X_AUTH_MODE=oauth1` for OAuth1 user-context access
+     - `X_AUTH_MODE=auto` to prefer Bearer auth when available, otherwise OAuth1
+   - Bearer mode:
+     - `X_BEARER_TOKEN`
+   - OAuth1 mode:
      - `X_OAUTH_CONSUMER_KEY`
      - `X_OAUTH_CONSUMER_SECRET`
-     - `X_BEARER_TOKEN` (required for this setup; keep it set even if using OAuth1)
    - OAuth1 callback (defaults are fine):
      - `X_OAUTH_CALLBACK_HOST` (default `127.0.0.1`)
      - `X_OAUTH_CALLBACK_PORT` (default `8976`)
@@ -29,11 +72,15 @@ FastMCP. Streaming and webhook endpoints are excluded.
    - Server settings (optional):
      - `X_API_BASE_URL` (default `https://api.x.com`)
      - `X_API_TIMEOUT` (default `30`)
+     - `X_READ_ONLY_ONLY` (default `0`; when `1`, only GET tools are exposed)
+     - `MCP_TRANSPORT` (default `http`; use `stdio` for Codex/desktop clients)
      - `MCP_HOST` (default `127.0.0.1`)
      - `MCP_PORT` (default `8000`)
+     - `MCP_PATH` (default `/mcp`)
      - `X_API_DEBUG` (default `1`)
-  - Tool filtering (optional, comma-separated):
-    - `X_API_TOOL_ALLOWLIST`
+   - Tool filtering (optional, comma-separated):
+     - `X_API_TOOL_ALLOWLIST`
+     - `X_API_TOOL_DENYLIST`
    - Optional Grok test client:
      - `XAI_API_KEY`
      - `XAI_MODEL` (default `grok-4-1-fast`)
@@ -42,7 +89,7 @@ FastMCP. Streaming and webhook endpoints are excluded.
      - `CLIENT_ID`
      - `CLIENT_SECRET`
      - `X_OAUTH_ACCESS_TOKEN`
-    - `X_OAUTH_ACCESS_TOKEN_SECRET` (optional)
+     - `X_OAUTH_ACCESS_TOKEN_SECRET` (optional; required for static OAuth1 signing)
    - Optional OAuth1 debug output:
      - `X_OAUTH_PRINT_TOKENS`
      - `X_OAUTH_PRINT_AUTH_HEADER`
@@ -64,7 +111,8 @@ http://127.0.0.1:8976/oauth/callback
 python server.py
 ```
 
-The MCP endpoint is `http://127.0.0.1:8000/mcp` by default.
+Default transport is HTTP, so the MCP endpoint is `http://127.0.0.1:8000/mcp`
+unless you set `MCP_TRANSPORT=stdio` or pass `--transport stdio`.
 
 5. Connect an MCP client:
 - Local client: point it to `http://127.0.0.1:8000/mcp`.
@@ -82,12 +130,19 @@ Whitelisting is applied at startup when the OpenAPI spec is loaded, so restart
 the server after changes. See the full tool list below before building your
 allowlist.
 
+If `X_READ_ONLY_ONLY=1`, you must also set `X_API_TOOL_ALLOWLIST`. That mode is
+intended for an explicit read-only surface, not "all GET endpoints".
+
 ## OAuth1 flow (startup behavior)
 
-On startup, the server opens a browser for OAuth1 consent and waits for the
-callback. Tokens are kept in memory only for the lifetime of the server
-process. Set `X_OAUTH_PRINT_TOKENS=1` to print tokens, or
-`X_OAUTH_PRINT_AUTH_HEADER=1` to print request headers.
+In `X_AUTH_MODE=oauth1`, the server will:
+
+- use `X_OAUTH_ACCESS_TOKEN` and `X_OAUTH_ACCESS_TOKEN_SECRET` if both are set
+- otherwise open a browser for OAuth1 consent and wait for the callback
+
+Tokens obtained through the interactive OAuth1 flow are kept in memory only for
+the lifetime of the server process. Set `X_OAUTH_PRINT_TOKENS=1` to print
+tokens, or `X_OAUTH_PRINT_AUTH_HEADER=1` to print request headers.
 
 ## Available tool calls (allowlist-ready)
 
@@ -217,10 +272,11 @@ Below is the full list of tool calls you can whitelist via
 ## Generate an OAuth2 user token (optional)
 
 1. Add `CLIENT_ID` and `CLIENT_SECRET` to your `.env`.
-2. Update `redirect_uri` in `generate_authtoken.py` to match your app settings.
-3. Run `python generate_authtoken.py` and follow the prompts.
-4. Copy the printed access token into `.env` as `X_OAUTH_ACCESS_TOKEN`.
-   If your flow returns a secret, store it as `X_OAUTH_ACCESS_TOKEN_SECRET`.
+2. Generate a user token with your preferred OAuth2 Authorization Code + PKCE
+   flow.
+3. Copy the access token into `.env` as `X_OAUTH_ACCESS_TOKEN`.
+4. If you are using OAuth1 static signing instead, also set
+   `X_OAUTH_ACCESS_TOKEN_SECRET`.
 
 ## Run the Grok MCP test client (optional)
 
